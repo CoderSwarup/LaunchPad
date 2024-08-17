@@ -1,7 +1,7 @@
 const express = require("express");
 const httpProxy = require("http-proxy");
 const dotenv = require("dotenv");
-
+const { PrismaClient } = require("@prisma/client");
 dotenv.config();
 
 const app = express();
@@ -9,10 +9,13 @@ const PORT = 8000;
 
 const BASE_PATH = process.env.OUTPUT_BASE_PATH;
 
+// Rrisma Connectin
+const prisma = new PrismaClient({});
+
 const proxy = httpProxy.createProxy();
 
 // TODO => Create a Kafka events that give the analytics-
-app.use((req, res) => {
+app.use(async (req, res) => {
   // console.log("REQUEST ");
   const hostname = req.hostname;
   const subdomain = hostname.split(".")[0];
@@ -20,8 +23,16 @@ app.use((req, res) => {
 
   // Custom Domain || SubDomain  - DB Query
   // find the id of the project
+  const project = await prisma.project.findFirst({
+    where: {
+      subDomain: subdomain,
+    },
+  });
 
-  const id = "87fd3a23-9610-418e-94ed-25458b682302";
+  // console.log(project);
+
+  const id = project?.id;
+  // const id = "a368073d-20bd-4555-abae-4d3ce138ee57";
 
   const resolvesTo = `${BASE_PATH}/${id}`;
   // console.log(resolvesTo);

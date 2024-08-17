@@ -11,8 +11,12 @@ const { v4: uuidv4 } = require("uuid");
 const fs = require("fs");
 const path = require("path");
 const cors = require("cors");
-
+const { exec } = require("child_process");
+const bcrypt = require("bcrypt");
+const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
+const { isAuthicatedUser } = require("./middlewares/AuthMiddleware");
+const jwt = require("jsonwebtoken");
 dotenv.config({});
 
 const config = {
@@ -39,6 +43,8 @@ const config = {
   // frontend
   FRONTEND_URL: process.env.FRONTEND_URL,
   FRONTEND_PROXY_URL: process.env.FRONTEND_PROXY_URL,
+
+  JWT_SECRET: process.env.JWT_SECRET,
 };
 
 const PORT = 9000;
@@ -156,7 +162,65 @@ async function initkafkaConsumer() {
 
 // Routes
 
-app.post("/project", async (req, res) => {
+app.post("/api/v1/register", async (req, res) => {
+  const { email, password, firstName, lastName } = req.body;
+
+  if (!email || !password || !firstName || !lastName) {
+    return res.status(400).json({ message: "Please fill in all fields" });
+  }
+
+  const hashPassword = await bcrypt.hash(password, 10);
+
+  const user = await prisma.user.create({
+    data: {
+      email,
+      password: hashPassword,
+      firstName,
+      lastName,
+    },
+  });
+
+  res.status(200).send({
+    message: "User created successfully",
+    user,
+  });
+});
+
+app.post("/api/v1/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ message: "Please fill in all fields" });
+  }
+
+  // find the user
+  const user = await prisma.user.findUnique({
+    where: {
+      email: email,
+    },
+  });
+
+  if (!user) {
+    console.log("User not found");
+
+    return res.status(401).json({ message: "Invalid email or password" });
+  }
+  const isPasswordCorrect = await bcrypt.compare(password, user.password);
+
+  if (!isPasswordCorrect) {
+    return res.status(401).json({ message: "Invalid email or password" });
+  }
+
+  const accessToken = jwt.sign(user, config.JWT_SECRET, { expiresIn: "15m" });
+
+  res.status(200).cookie("token", accessToken).send({
+    success: true,
+    message: "User login successfully",
+    user,
+  });
+});
+
+app.post("/api/v1/project", isAuthicatedUser, async (req, res) => {
   const { name, gitURL } = req.body;
 
   const gitURLPattern = /^(https?:\/\/)?(www\.)?github\.com\/.+/i;
@@ -184,13 +248,14 @@ app.post("/project", async (req, res) => {
       name,
       gitURL,
       subDomain: generateSlug(),
+      userId: req.user.id,
     },
   });
 
   return res.json({ status: "success", data: { project } });
 });
 
-app.post("/deploy", async (req, res) => {
+app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
   const { projectId } = req.body;
 
   if (typeof projectId !== "string" || !projectId || projectId.trim() === "") {
@@ -198,7 +263,7 @@ app.post("/deploy", async (req, res) => {
   }
 
   const project = await prisma.project.findUnique({
-    where: { id: projectId },
+    where: { id: projectId, userId: req.user.id },
   });
 
   if (!project) {
@@ -256,7 +321,7 @@ app.post("/deploy", async (req, res) => {
     },
   });
 
-  await ecsClient.send(command);
+  // await ecsClient.send(command);
 
   // return res.json({
   //   status: "queued",
@@ -266,13 +331,13 @@ app.post("/deploy", async (req, res) => {
   return res.json({
     status: "queued",
     data: {
-      deploymentId: deployment.id,
+      // deploymentId: deployment.id,
       url: `http://${project.subDomain}.${config.FRONTEND_PROXY_URL}`,
     },
   });
 
   // Run the Docker image locally
-  // const command = `docker run -it -e PROJECT_ID=${projectSlug} -e GIT_REPOSITORY__URL=${gitURL} 6e9178b0fbb6d526451651ac938003ea65a5b8551962ee4c4ad787c048829169`;
+  // const command = `docker run -it -e GIT_REPOSITORY__URL=${project.gitURL} -e PROJECT_ID=${projectId} -e DEPLOYEMENT_ID=${deployment.id} -e AWS_ACCESSKEYID=${config.AWS_ACCESSKEYID} -e AWS_SECRETACCESSKEY=${config.AWS_SECRETACCESSKEY} -e KAFKA_BROKER_URL=${config.KAFKA_BROKER_URL} -e KAFKA_USER_NAME=${config.KAFKA_USER_NAME} -e KAFKA_PASSWORD=${config.KAFKA_PASSWORD} builder-server`;
 
   // exec(command, (error, stdout, stderr) => {
   //   if (error) {
@@ -286,14 +351,21 @@ app.post("/deploy", async (req, res) => {
   //   if (stderr) {
   //     console.error(`Docker run error: ${stderr}`);
   //   }
+  //   // return res.json({
+  //   //   status: "queued",
+  //   //   data: { projectSlug, url: `http://${projectSlug}.localhost:8000` },
+  //   // });
   //   return res.json({
   //     status: "queued",
-  //     data: { projectSlug, url: `http://${projectSlug}.localhost:8000` },
+  //     data: {
+  //       deploymentId: deployment.id,
+  //       url: `http://${project.subDomain}.${config.FRONTEND_PROXY_URL}`,
+  //     },
   //   });
   // });
 });
 
-app.get("/logs/:id", async (req, res) => {
+app.get("/api/v1/logs/:id", isAuthicatedUser, async (req, res) => {
   const id = req.params.id; // Deployment ID
   const logs = await clickhouseClient.query({
     query: `SELECT event_id, deployment_id, log, timestamp from log_events where deployment_id = {deployment_id:String}`,
