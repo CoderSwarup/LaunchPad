@@ -14,3 +14,15 @@ ORDER BY (timestamp);
 
 --  To get the all events
 SELECT * FROM log_events;
+
+
+-- ---- VISITOURS  COUNT 
+
+CREATE TABLE visitor_counts (
+    project_id String,
+    visitor_count UInt64,
+    date Date,
+    timestamp DateTime DEFAULT now()
+) 
+ENGINE = MergeTree()
+ORDER BY (project_id, date, timestamp);

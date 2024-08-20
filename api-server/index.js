@@ -15,7 +15,7 @@ const { exec } = require("child_process");
 const bcrypt = require("bcrypt");
 const bodyParser = require("body-parser");
 const dotenv = require("dotenv");
-const { isAuthicatedUser } = require("./middlewares/AuthMiddleware");
+const { isAuthenticatedUser } = require("./middlewares/AuthMiddleware");
 const jwt = require("jsonwebtoken");
 dotenv.config({});
 
@@ -106,6 +106,11 @@ const consumer = kafka.consumer({ groupId: "api-server-logs-consumer" });
 // Middlewares
 app.use(express.json());
 app.use(
+  express.urlencoded({
+    extended: true,
+  })
+);
+app.use(
   cors({
     origin: config.FRONTEND_URL || "*",
   })
@@ -122,19 +127,24 @@ app.use(
 // }
 
 // Kafka Consumer function
-async function initkafkaConsumer() {
-  await consumer.connect();
-  await consumer.subscribe({ topics: ["container-logs"], fromBeginning: true });
+const logConsumer = kafka.consumer({ groupId: "log-group" });
 
-  await consumer.run({
-    eachBatch: async function ({
+async function initLogConsumer() {
+  await logConsumer.connect();
+  await logConsumer.subscribe({
+    topics: ["container-logs"],
+    fromBeginning: true,
+  });
+
+  await logConsumer.run({
+    eachBatch: async ({
       batch,
       heartbeat,
       commitOffsetsIfNecessary,
       resolveOffset,
-    }) {
+    }) => {
       const messages = batch.messages;
-      console.log(`Recv. ${messages.length} messages..`);
+      console.log(`Received ${messages.length} log messages.`);
       for (const message of messages) {
         if (!message.value) continue;
         const stringMessage = message.value.toString();
@@ -153,7 +163,61 @@ async function initkafkaConsumer() {
           await commitOffsetsIfNecessary(message.offset);
           await heartbeat();
         } catch (err) {
-          console.log("Error Get : ", err);
+          console.error("Error in log consumer: ", err);
+        }
+      }
+    },
+  });
+}
+
+// Visitor Count
+const visitorConsumer = kafka.consumer({ groupId: "visitor-group" });
+
+async function initVisitorConsumer() {
+  await visitorConsumer.connect();
+  await visitorConsumer.subscribe({
+    topics: ["visitor-counts"],
+    fromBeginning: true,
+  });
+
+  await visitorConsumer.run({
+    eachBatch: async ({
+      batch,
+      heartbeat,
+      commitOffsetsIfNecessary,
+      resolveOffset,
+    }) => {
+      const messages = batch.messages;
+      console.log(`Received ${messages.length} visitor count messages.`);
+      for (const message of messages) {
+        if (!message.value) continue;
+        const stringMessage = message.value.toString();
+        const { PROJECT_ID } = JSON.parse(stringMessage);
+        console.log({ PROJECT_ID });
+
+        // Get the current date in YYYY-MM-DD format
+        const currentDate = new Date().toISOString().split("T")[0];
+
+        try {
+          const { query_id } = await clickhouseClient.insert({
+            table: "visitor_counts",
+            values: [
+              {
+                project_id: PROJECT_ID,
+                visitor_count: 1,
+                date: currentDate,
+              },
+            ],
+            format: "JSONEachRow",
+          });
+
+          console.log(`Inserted new record with query_id: ${query_id}`);
+
+          resolveOffset(message.offset);
+          await commitOffsetsIfNecessary(message.offset);
+          await heartbeat();
+        } catch (err) {
+          console.error("Error in visitor consumer: ", err);
         }
       }
     },
@@ -162,11 +226,26 @@ async function initkafkaConsumer() {
 
 // Routes
 
+// register
 app.post("/api/v1/register", async (req, res) => {
   const { email, password, firstName, lastName } = req.body;
 
   if (!email || !password || !firstName || !lastName) {
-    return res.status(400).json({ message: "Please fill in all fields" });
+    return res
+      .status(400)
+      .send({ success: false, message: "Please fill in all fields" });
+  }
+
+  const isUserExist = await prisma.user.findUnique({
+    where: {
+      email: email,
+    },
+  });
+
+  if (isUserExist) {
+    return res
+      .status(400)
+      .send({ success: false, message: "User already exist" });
   }
 
   const hashPassword = await bcrypt.hash(password, 10);
@@ -186,11 +265,14 @@ app.post("/api/v1/register", async (req, res) => {
   });
 });
 
+// Login
 app.post("/api/v1/login", async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ message: "Please fill in all fields" });
+    return res
+      .status(400)
+      .send({ success: false, message: "Please fill in all fields" });
   }
 
   // find the user
@@ -201,32 +283,141 @@ app.post("/api/v1/login", async (req, res) => {
   });
 
   if (!user) {
-    console.log("User not found");
-
-    return res.status(401).json({ message: "Invalid email or password" });
+    return res
+      .status(401)
+      .send({ success: false, message: "Invalid email or password" });
   }
   const isPasswordCorrect = await bcrypt.compare(password, user.password);
 
   if (!isPasswordCorrect) {
-    return res.status(401).json({ message: "Invalid email or password" });
+    return res
+      .status(401)
+      .send({ success: false, message: "Invalid email or password" });
   }
 
-  const accessToken = jwt.sign(user, config.JWT_SECRET, { expiresIn: "15m" });
+  const accessToken = jwt.sign(user, config.JWT_SECRET, { expiresIn: "1d" });
 
   res.status(200).cookie("token", accessToken).send({
     success: true,
     message: "User login successfully",
     user,
+    token: accessToken,
   });
 });
 
-app.post("/api/v1/project", isAuthicatedUser, async (req, res) => {
+// Get prokects
+app.get("/api/v1/get-projects", isAuthenticatedUser, async (req, res) => {
+  const projects = await prisma.project.findMany({
+    where: {
+      userId: req.user.id,
+    },
+    include: {
+      Deployement: {
+        select: {
+          status: true,
+        },
+      },
+    },
+  });
+
+  const formattedProjects = projects.map((project) => ({
+    ...project,
+    status: project.Deployement[0]?.status || "NOT_STARTED",
+  }));
+
+  return res.status(200).send({
+    success: true,
+    message: "Projects retrieved successfully",
+    projects: formattedProjects,
+  });
+});
+
+// get the Single Project
+app.get(
+  "/api/v1/get-single-project/:projectID",
+  isAuthenticatedUser,
+  async (req, res) => {
+    const { projectID } = req.params; // Use req.params for GET requests
+
+    try {
+      const project = await prisma.project.findUnique({
+        where: {
+          id: projectID,
+          userId: req.user.id,
+        },
+      });
+
+      if (!project) {
+        return res.status(404).send({
+          success: false,
+          message: "Project not found",
+        });
+      }
+
+      return res.status(200).send({
+        success: true,
+        message: "Project retrieved successfully",
+        project,
+      });
+    } catch (error) {
+      console.log(error);
+
+      return res.status(500).send({
+        success: false,
+        message: "An error occurred while retrieving the project",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// get the Deployment id
+app.get(
+  "/api/v1/get-deployment-id/:projectID",
+  isAuthenticatedUser,
+  async (req, res) => {
+    const { projectID } = req.params;
+
+    try {
+      const deployment = await prisma.deployement.findFirst({
+        where: {
+          projectId: projectID,
+        },
+      });
+
+      if (!deployment) {
+        return res.status(404).send({
+          success: false,
+          message: "Deployment Id not found",
+        });
+      }
+
+      return res.status(200).send({
+        success: true,
+        message: "Project retrieved successfully",
+        deploymentId: deployment.id,
+      });
+    } catch (error) {
+      console.log(error);
+
+      return res.status(500).send({
+        success: false,
+        message: "An error occurred while retrieving the project",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// Create a Project
+app.post("/api/v1/project", isAuthenticatedUser, async (req, res) => {
   const { name, gitURL } = req.body;
 
   const gitURLPattern = /^(https?:\/\/)?(www\.)?github\.com\/.+/i;
 
   if (typeof name !== "string" || name.trim() === "") {
-    return res.status(400).json({
+    return res.status(400).send({
+      success: false,
       message: "Invalid project name. It must be a non-empty string.",
     });
   }
@@ -237,7 +428,8 @@ app.post("/api/v1/project", isAuthicatedUser, async (req, res) => {
     gitURL.trim() === "" ||
     !gitURLPattern.test(gitURL)
   ) {
-    return res.status(400).json({
+    return res.status(400).send({
+      success: false,
       error:
         "Invalid git URL. It must be a non-empty string starting with github.com.",
     });
@@ -252,14 +444,22 @@ app.post("/api/v1/project", isAuthicatedUser, async (req, res) => {
     },
   });
 
-  return res.json({ status: "success", data: { project } });
+  return res.send({
+    success: true,
+    status: "success",
+    message: "Project created Succefully",
+    project,
+  });
 });
 
-app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
+// Deploy the Project
+app.post("/api/v1/deploy", isAuthenticatedUser, async (req, res) => {
   const { projectId } = req.body;
 
   if (typeof projectId !== "string" || !projectId || projectId.trim() === "") {
-    return res.status(400).json({ error: "Project ID is required." });
+    return res
+      .status(400)
+      .send({ success: false, error: "Project ID is required." });
   }
 
   const project = await prisma.project.findUnique({
@@ -267,7 +467,9 @@ app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
   });
 
   if (!project) {
-    return res.status(404).json({ error: "Project not found." });
+    return res
+      .status(404)
+      .send({ success: false, error: "Project not found." });
   }
   // console.log("Project ", project);
 
@@ -275,7 +477,7 @@ app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
   const deployment = await prisma.deployement.create({
     data: {
       project: { connect: { id: projectId } },
-      status: "QUEUED",
+      status: "READY",
     },
   });
   // console.log("Deployment ", deployment);
@@ -321,7 +523,7 @@ app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
     },
   });
 
-  // await ecsClient.send(command);
+  await ecsClient.send(command);
 
   // return res.json({
   //   status: "queued",
@@ -329,9 +531,11 @@ app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
   // });
 
   return res.json({
+    success: true,
     status: "queued",
+    message: "Deployed Succefully",
     data: {
-      // deploymentId: deployment.id,
+      deploymentId: deployment.id,
       url: `http://${project.subDomain}.${config.FRONTEND_PROXY_URL}`,
     },
   });
@@ -365,7 +569,8 @@ app.post("/api/v1/deploy", isAuthicatedUser, async (req, res) => {
   // });
 });
 
-app.get("/api/v1/logs/:id", isAuthicatedUser, async (req, res) => {
+// Get logs
+app.get("/api/v1/logs/:id", isAuthenticatedUser, async (req, res) => {
   const id = req.params.id; // Deployment ID
   const logs = await clickhouseClient.query({
     query: `SELECT event_id, deployment_id, log, timestamp from log_events where deployment_id = {deployment_id:String}`,
@@ -377,8 +582,43 @@ app.get("/api/v1/logs/:id", isAuthicatedUser, async (req, res) => {
 
   const rawLogs = await logs.json();
 
-  return res.json({ logs: rawLogs });
+  return res.status(200).send({ success: true, logs: rawLogs });
 });
+// get the Visitors Count
+app.get(
+  "/api/v1/visitor-count/:projectID",
+  isAuthenticatedUser,
+  async (req, res) => {
+    const { projectID } = req.params;
+
+    try {
+      const result = await clickhouseClient.query({
+        query: `
+        SELECT 
+          date, 
+          SUM(visitor_count) AS visitor_count
+        FROM 
+          visitor_counts
+        WHERE 
+          project_id = {projectID:String}
+        GROUP BY 
+          date
+        ORDER BY 
+          date DESC
+        LIMIT 15;
+      `,
+        query_params: { projectID },
+        format: "JSONEachRow",
+      });
+
+      const data = await result.json();
+      res.status(200).json(data);
+    } catch (err) {
+      console.error("Error fetching visitor data: ", err);
+      res.status(500).json({ error: "Failed to fetch visitor data" });
+    }
+  }
+);
 
 // Socket
 
@@ -392,7 +632,8 @@ io.on("connection", (socket) => {
 });
 
 // initRedisSubscribe();  // For redis
-initkafkaConsumer(); // Kafka
+initLogConsumer(); // Kafka
+initVisitorConsumer();
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });

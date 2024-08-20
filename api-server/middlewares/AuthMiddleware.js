@@ -3,7 +3,7 @@ const dotenv = require("dotenv");
 const { PrismaClient } = require("@prisma/client");
 dotenv.config();
 const prisma = new PrismaClient({});
-exports.isAuthicatedUser = async (req, res, next) => {
+exports.isAuthenticatedUser = async (req, res, next) => {
   try {
     const token =
       req.cookies?.accessToken ||
